@@ -1,10 +1,10 @@
-use bitcoin::hashes::sha256d::Hash as Sha256dHash;
+use bitcoin::hashes::{hash160::Hash, sha256d::Hash as Sha256dHash};
 #[cfg(not(feature = "liquid"))]
 use bitcoin::merkle_tree::MerkleBlock;
 use bitcoin::VarInt;
 use crypto::digest::Digest;
 use crypto::sha2::Sha256;
-use hex::FromHex;
+use hex::{DisplayHex, FromHex};
 use itertools::Itertools;
 use rayon::prelude::*;
 
@@ -17,9 +17,12 @@ use elements::{
     AssetId,
 };
 
-use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
+use std::{
+    collections::{BTreeSet, HashMap, HashSet},
+    io::Read,
+};
 
 use crate::chain::{
     BlockHash, BlockHeader, Network, OutPoint, Script, Transaction, TxOut, Txid, Value,
@@ -48,13 +51,15 @@ pub struct Store {
     cache_db: DB,
     added_blockhashes: RwLock<HashSet<BlockHash>>,
     indexed_blockhashes: RwLock<HashSet<BlockHash>>,
+    cache_warmed_blockhashes: RwLock<HashSet<BlockHash>>,
     indexed_headers: RwLock<HeaderList>,
 }
 
 impl Store {
     pub fn open(path: &Path, config: &Config) -> Self {
         let txstore_db = DB::open(&path.join("txstore"), config);
-        let added_blockhashes = load_blockhashes(&txstore_db, &BlockRow::done_filter());
+        let added_blockhashes: HashSet<BlockHash> =
+            load_blockhashes(&txstore_db, &BlockRow::done_filter());
         debug!("{} blocks were added", added_blockhashes.len());
 
         let history_db = DB::open(&path.join("history"), config);
@@ -62,6 +67,11 @@ impl Store {
         debug!("{} blocks were indexed", indexed_blockhashes.len());
 
         let cache_db = DB::open(&path.join("cache"), config);
+        let cache_warmed_blockhashes = load_blockhashes(&cache_db, &BlockRow::done_filter());
+        debug!(
+            "{} blocks were cache warmed",
+            cache_warmed_blockhashes.len()
+        );
 
         let headers = if let Some(tip_hash) = txstore_db.get(b"t") {
             let tip_hash = deserialize(&tip_hash).expect("invalid chain tip in `t`");
@@ -82,6 +92,7 @@ impl Store {
             cache_db,
             added_blockhashes: RwLock::new(added_blockhashes),
             indexed_blockhashes: RwLock::new(indexed_blockhashes),
+            cache_warmed_blockhashes: RwLock::new(cache_warmed_blockhashes),
             indexed_headers: RwLock::new(headers),
         }
     }
@@ -259,6 +270,18 @@ impl Indexer {
         Ok(result)
     }
 
+    fn get_indexed_headers_to_warm_up_cache(&self) -> Vec<HeaderEntry> {
+        let cache_warmed_blockhashes = self.store.cache_warmed_blockhashes.read().unwrap();
+        self.store
+            .indexed_headers
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|e| !cache_warmed_blockhashes.contains(e.hash()))
+            .cloned()
+            .collect()
+    }
+
     pub fn update(&mut self, daemon: &Daemon) -> Result<BlockHash> {
         let daemon = daemon.reconnect()?;
         let tip = daemon.getbestblockhash()?;
@@ -282,10 +305,22 @@ impl Indexer {
         start_fetcher(self.from, &daemon, to_index)?.map(|blocks| self.index(&blocks));
         self.start_auto_compactions(&self.store.history_db);
 
+        //let to_cache_warm = vec![self.get_indexed_headers_to_warm_up_cache()[0].clone()];
+        let to_cache_warm = self.get_indexed_headers_to_warm_up_cache();
+        debug!(
+            "warm cache from {} blocks using {:?}",
+            to_cache_warm.len(),
+            self.from
+        );
+        let mut utxos_to_update: HashMap<FullHash, RawUtxoMap> = HashMap::new();
+        start_fetcher(self.from, &daemon, to_cache_warm)?.map(|blocks| self.warm(&blocks, &mut utxos_to_update));
+        self.start_auto_compactions(&self.store.cache_db);
+
         if let DBFlush::Disable = self.flush {
             debug!("flushing to disk");
             self.store.txstore_db.flush();
             self.store.history_db.flush();
+            self.store.cache_db.flush();
             self.flush = DBFlush::Enable;
         }
 
@@ -342,6 +377,37 @@ impl Indexer {
             index_blocks(blocks, &previous_txos_map, &self.iconfig)
         };
         self.store.history_db.write(rows, self.flush);
+    }
+
+    fn warm(&self, blocks: &[BlockEntry], utxos_to_update: &mut HashMap<FullHash, RawUtxoMap>) {
+        debug!(
+            "Warming {} blocks and last is {}.....",
+            blocks.len(),
+            blocks.last().map(|b| b.entry.height()).unwrap()
+        );
+        let previous_txos_map = {
+            let _timer = self.start_timer("cache_warm_lookup");
+            lookup_txos(&self.store.txstore_db, &get_previous_txos(blocks), false)
+        };
+        let rows = {
+            let _timer: HistogramTimer = self.start_timer("cache_warm_process");
+            let added_blockhashes: std::sync::RwLockReadGuard<HashSet<BlockHash>> =
+                self.store.added_blockhashes.read().unwrap();
+            for b in blocks {
+                let blockhash = b.entry.hash();
+                if !added_blockhashes.contains(blockhash) {
+                    panic!("cannot cache warm block {} (missing from store)", blockhash);
+                }
+            }
+            //get_warmed_cache_rows(blocks, &previous_txos_map, &self.store.cache_db, utxos_to_update)
+            get_warmed_cache_rows(blocks, &previous_txos_map, &self.store.cache_db)
+        };
+        self.store.cache_db.write(rows, self.flush);
+        self.store
+            .cache_warmed_blockhashes
+            .write()
+            .unwrap()
+            .extend(blocks.iter().map(|b| b.entry.hash()));
     }
 
     pub fn fetch_from(&mut self, from: FetchFrom) {
@@ -540,26 +606,10 @@ impl ChainQuery {
                     .map(|height| (utxos_cache, height))
             })
             .map(|(utxos_cache, height)| (from_utxo_cache(utxos_cache, self), height));
-        let had_cache = cache.is_some();
-
-        // update utxo set with new transactions since
-        let (newutxos, lastblock, processed_items) = cache.map_or_else(
-            || self.utxo_delta(scripthash, HashMap::new(), 0, limit),
-            |(oldutxos, blockheight)| self.utxo_delta(scripthash, oldutxos, blockheight + 1, limit),
-        )?;
-
-        // save updated utxo set to cache
-        if let Some(lastblock) = lastblock {
-            if had_cache || processed_items > MIN_HISTORY_ITEMS_TO_CACHE {
-                self.store.cache_db.write(
-                    vec![UtxoCacheRow::new(scripthash, &newutxos, &lastblock).into_row()],
-                    DBFlush::Enable,
-                );
-            }
-        }
 
         // format as Utxo objects
-        Ok(newutxos
+        Ok(cache
+            .map_or_else(|| HashMap::new(), |(utxos, _)| utxos)
             .into_iter()
             .map(|(outpoint, (blockid, value))| {
                 // in elements/liquid chains, we have to lookup the txo in order to get its
@@ -1086,6 +1136,106 @@ fn index_blocks(
         .collect()
 }
 
+fn get_warmed_cache_rows(
+    block_entries: &[BlockEntry],
+    previous_txos_map: &HashMap<OutPoint, TxOut>,
+    cache_db: &DB
+    //utxos_to_update: &mut HashMap<FullHash, RawUtxoMap> 
+) -> Vec<DBRow> {
+    let mut utxos_to_update: HashMap<FullHash, RawUtxoMap> = HashMap::new();
+    let mut rows = vec![];
+    let mut lastblock = None;
+    for b in block_entries {
+        lastblock = Some(b.entry.hash().clone());
+        for tx in &b.block.txdata {
+            update_warmed_cache_rows_from_transaction(
+                b.entry.height() as u32,
+                previous_txos_map,
+                tx,
+                cache_db,
+                &mut utxos_to_update,
+            );
+        }
+        rows.push(BlockRow::new_done(full_hash(&b.entry.hash()[..])).into_row());
+    }
+    if lastblock.is_some() {
+        for (scripthash, utxos) in &utxos_to_update {
+            rows.push(UtxoCacheRow::new_from_row(scripthash, utxos, &lastblock.unwrap()).into_row())
+        }
+    }
+    rows
+}
+
+fn update_current_utxos(
+    current: &mut HashMap<FullHash, RawUtxoMap>,
+    cache_db: &DB,
+    script_hash: &FullHash,
+    k: (Txid, u32),
+    v: Option<(u32, u64)>,
+) {
+    let mut current_utxo = current.entry(script_hash.clone()).or_insert_with(|| {
+        let current_cached_utxos: Option<RawUtxoMap> = cache_db
+            .get(&UtxoCacheRow::key(script_hash))
+            .map(|c| bincode::deserialize_little(&c).unwrap())
+            .map(|(utxo, _): (RawUtxoMap, BlockHash)| utxo);
+        current_cached_utxos.unwrap_or(HashMap::new())
+    });
+    if v.is_some() {
+        current_utxo.insert(k, v.unwrap());
+        // info!(
+        //     "Insert UTXO for scripthash {}： (txid,vout):({},{}) (block_height,value):({},{})",
+        //     script_hash.to_lower_hex_string(),
+        //     k.0.to_string(),
+        //     k.1,
+        //     v.unwrap().0,
+        //     v.unwrap().1
+        // )
+    } else {
+        current_utxo.remove(&k);
+        // info!(
+        //     "Remove UTXO for scripthash {}： (txid,vout):({},{})",
+        //     script_hash.to_lower_hex_string(),
+        //     k.0.to_string(),
+        //     k.1,
+        // )
+    }
+}
+
+fn update_warmed_cache_rows_from_transaction(
+    block_height: u32,
+    previous_txos_map: &HashMap<OutPoint, TxOut>,
+    tx: &Transaction,
+    cache_db: &DB,
+    utxos_to_update: &mut HashMap<FullHash, RawUtxoMap>,
+) {
+    for (txo_index, txo) in tx.output.iter().enumerate() {
+        if is_spendable(txo) {
+            update_current_utxos(
+                utxos_to_update,
+                cache_db,
+                &compute_script_hash(&txo.script_pubkey),
+                (tx.txid(), txo_index as u32),
+                Some((block_height, txo.value.amount_value())),
+            );
+        }
+    }
+    for (txi_index, txi) in tx.input.iter().enumerate() {
+        if !has_prevout(txi) {
+            continue;
+        }
+        let prev_txo = previous_txos_map
+            .get(&txi.previous_output)
+            .unwrap_or_else(|| panic!("missing previous txo {}", txi.previous_output));
+        update_current_utxos(
+            utxos_to_update,
+            cache_db,
+            &compute_script_hash(&prev_txo.script_pubkey),
+            (txi.previous_output.txid, txi.previous_output.vout),
+            None,
+        )
+    }
+}
+
 // TODO: return an iterator?
 fn index_transaction(
     tx: &Transaction,
@@ -1585,6 +1735,8 @@ impl StatsCacheRow {
 
 type CachedUtxoMap = HashMap<(Txid, u32), (u32, Value)>; // (txid,vout) => (block_height,output_value)
 
+type RawUtxoMap = HashMap<(Txid, u32), (u32, u64)>;
+
 struct UtxoCacheRow {
     key: ScriptCacheKey,
     value: Bytes,
@@ -1592,7 +1744,7 @@ struct UtxoCacheRow {
 
 impl UtxoCacheRow {
     fn new(scripthash: &[u8], utxos: &UtxoMap, blockhash: &BlockHash) -> Self {
-        let utxos_cache = make_utxo_cache(utxos);
+        let utxos_cache: HashMap<(Txid, u32), (u32, u64)> = make_utxo_cache(utxos);
 
         UtxoCacheRow {
             key: ScriptCacheKey {
@@ -1600,6 +1752,16 @@ impl UtxoCacheRow {
                 scripthash: full_hash(scripthash),
             },
             value: bincode::serialize_little(&(utxos_cache, blockhash)).unwrap(),
+        }
+    }
+
+    fn new_from_row(scripthash: &[u8], utxos: &RawUtxoMap, blockhash: &BlockHash) -> Self {
+        UtxoCacheRow {
+            key: ScriptCacheKey {
+                code: b'U',
+                scripthash: full_hash(scripthash),
+            },
+            value: bincode::serialize_little(&(utxos, blockhash)).unwrap(),
         }
     }
 
