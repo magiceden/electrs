@@ -4,7 +4,7 @@ use bitcoin::merkle_tree::MerkleBlock;
 use bitcoin::VarInt;
 use crypto::digest::Digest;
 use crypto::sha2::Sha256;
-use hex::FromHex;
+use hex::{DisplayHex, FromHex};
 use itertools::Itertools;
 use rayon::prelude::*;
 
@@ -18,8 +18,11 @@ use elements::{
 };
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::path::Path;
 use std::sync::{Arc, RwLock};
+use std::{
+    path::Path,
+    time::{Duration, Instant},
+};
 
 use crate::chain::{
     BlockHash, BlockHeader, Network, OutPoint, Script, Transaction, TxOut, Txid, Value,
@@ -593,12 +596,17 @@ impl ChainQuery {
         limit: usize,
     ) -> Result<(UtxoMap, Option<BlockHash>, usize)> {
         let _timer = self.start_timer("utxo_delta");
+        let start = Instant::now();
         let history_iter = self
             .history_iter_scan(b'H', scripthash, start_height)
             .map(TxHistoryRow::from_row)
-            .filter_map(|history| {
-                self.tx_confirming_block(&history.get_txid())
-                    .map(|b| (history, b))
+            .map(|history| {
+                let height = history.key.confirmed_height;
+                (
+                    history,
+                    self.blockid_by_height(height as usize)
+                        .expect("missing blockheader for valid utxo cache entry"),
+                )
             });
 
         let mut utxos = init_utxos;
@@ -626,7 +634,14 @@ impl ChainQuery {
                 bail!(ErrorKind::TooPopular)
             }
         }
-
+        let elapsed = Instant::now().duration_since(start);
+        if elapsed.ge(&Duration::from_millis(1000 as u64)) {
+            warn!(
+                "Long time({} milliseconds) to calc UTXO delta for script hash {}: larger then 1000 milliseconds",
+                elapsed.as_millis(),
+                scripthash.to_lower_hex_string()
+            );
+        }
         Ok((utxos, lastblock, processed_items))
     }
 
