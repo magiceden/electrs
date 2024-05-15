@@ -615,7 +615,7 @@ impl ChainQuery {
                     .block_hash
                     // returns None for orphaned blocks
                     .and_then(|hash| self.blockid_by_hash(&hash))
-                    .or_else(||self.tx_confirming_block(&history.get_txid()))
+                    .or_else(|| self.tx_confirming_block(&history.get_txid()))
                     .map(|block_id| (history, block_id))
             });
 
@@ -703,7 +703,7 @@ impl ChainQuery {
                 history
                     .block_hash
                     .and_then(|hash| self.blockid_by_hash(&hash))
-                    .or_else(||self.tx_confirming_block(&history.get_txid()))
+                    .or_else(|| self.tx_confirming_block(&history.get_txid()))
                     // drop history entries that were previously confirmed in a re-orged block and later
                     // confirmed again at a different height
                     .filter(|blockid| blockid.height == history.key.confirmed_height as usize)
