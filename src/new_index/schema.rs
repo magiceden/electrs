@@ -4,7 +4,7 @@ use bitcoin::merkle_tree::MerkleBlock;
 use bitcoin::VarInt;
 use crypto::digest::Digest;
 use crypto::sha2::Sha256;
-use hex::FromHex;
+use hex::{DisplayHex, FromHex};
 use itertools::Itertools;
 use rayon::prelude::*;
 
@@ -18,8 +18,11 @@ use elements::{
 };
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::path::Path;
 use std::sync::{Arc, RwLock};
+use std::{
+    path::Path,
+    time::{Duration, Instant},
+};
 
 use crate::chain::{
     BlockHash, BlockHeader, Network, OutPoint, Script, Transaction, TxOut, Txid, Value,
@@ -259,6 +262,16 @@ impl Indexer {
         Ok(result)
     }
 
+    pub fn get_all_indexed_headers(&self) -> Vec<HeaderEntry> {
+        self.store
+            .indexed_headers
+            .read()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect()
+    }
+
     pub fn update(&mut self, daemon: &Daemon) -> Result<BlockHash> {
         let daemon = daemon.reconnect()?;
         let tip = daemon.getbestblockhash()?;
@@ -324,7 +337,7 @@ impl Indexer {
             .extend(blocks.iter().map(|b| b.entry.hash()));
     }
 
-    fn index(&self, blocks: &[BlockEntry]) {
+    pub fn index(&self, blocks: &[BlockEntry]) {
         let previous_txos_map = {
             let _timer = self.start_timer("index_lookup");
             lookup_txos(&self.store.txstore_db, &get_previous_txos(blocks), false)
@@ -593,15 +606,20 @@ impl ChainQuery {
         limit: usize,
     ) -> Result<(UtxoMap, Option<BlockHash>, usize)> {
         let _timer = self.start_timer("utxo_delta");
+        let start = Instant::now();
         let history_iter = self
             .history_iter_scan(b'H', scripthash, start_height)
             .map(TxHistoryRow::from_row)
             .filter_map(|history| {
-                self.tx_confirming_block(&history.get_txid())
-                    .map(|b| (history, b))
+                history
+                    .block_hash
+                    // returns None for orphaned blocks
+                    .and_then(|hash| self.blockid_by_hash(&hash))
+                    .or_else(|| self.tx_confirming_block(&history.get_txid()))
+                    .map(|block_id| (history, block_id))
             });
 
-        let mut utxos = init_utxos;
+        let mut utxos: HashMap<OutPoint, (BlockId, u64)> = init_utxos;
         let mut processed_items = 0;
         let mut lastblock = None;
 
@@ -626,7 +644,14 @@ impl ChainQuery {
                 bail!(ErrorKind::TooPopular)
             }
         }
-
+        let elapsed = Instant::now().duration_since(start);
+        if elapsed.ge(&Duration::from_millis(1000 as u64)) {
+            warn!(
+                "Long time({} milliseconds) to calc UTXO delta for script hash {}: larger then 1000 milliseconds",
+                elapsed.as_millis(),
+                scripthash.to_lower_hex_string()
+            );
+        }
         Ok((utxos, lastblock, processed_items))
     }
 
@@ -675,11 +700,14 @@ impl ChainQuery {
             .history_iter_scan(b'H', scripthash, start_height)
             .map(TxHistoryRow::from_row)
             .filter_map(|history| {
-                self.tx_confirming_block(&history.get_txid())
+                history
+                    .block_hash
+                    .and_then(|hash| self.blockid_by_hash(&hash))
+                    .or_else(|| self.tx_confirming_block(&history.get_txid()))
                     // drop history entries that were previously confirmed in a re-orged block and later
                     // confirmed again at a different height
                     .filter(|blockid| blockid.height == history.key.confirmed_height as usize)
-                    .map(|blockid| (history, blockid))
+                    .map(|block_id| (history, block_id))
             });
 
         let mut stats = init_stats;
@@ -1077,7 +1105,15 @@ fn index_blocks(
             let mut rows = vec![];
             for tx in &b.block.txdata {
                 let height = b.entry.height() as u32;
-                index_transaction(tx, height, previous_txos_map, &mut rows, iconfig);
+                let block_hash = b.entry.hash();
+                index_transaction(
+                    tx,
+                    height,
+                    previous_txos_map,
+                    &mut rows,
+                    iconfig,
+                    block_hash,
+                );
             }
             rows.push(BlockRow::new_done(full_hash(&b.entry.hash()[..])).into_row()); // mark block as "indexed"
             rows
@@ -1093,10 +1129,11 @@ fn index_transaction(
     previous_txos_map: &HashMap<OutPoint, TxOut>,
     rows: &mut Vec<DBRow>,
     iconfig: &IndexerConfig,
+    block_hash: &BlockHash,
 ) {
     // persist history index:
-    //      H{funding-scripthash}{funding-height}F{funding-txid:vout} → ""
-    //      H{funding-scripthash}{spending-height}S{spending-txid:vin}{funding-txid:vout} → ""
+    //      H{funding-scripthash}{funding-height}F{funding-txid:vout} → "{funding-blockhash}"
+    //      H{funding-scripthash}{spending-height}S{spending-txid:vin}{funding-txid:vout} → "{spending-blockhash}"
     // persist "edges" for fast is-this-TXO-spent check
     //      S{funding-txid:vout}{spending-txid:vin} → ""
     let txid = full_hash(&tx.txid()[..]);
@@ -1110,6 +1147,7 @@ fn index_transaction(
                     vout: txo_index as u16,
                     value: txo.value.amount_value(),
                 }),
+                block_hash,
             );
             rows.push(history.into_row());
 
@@ -1138,6 +1176,7 @@ fn index_transaction(
                 prev_vout: txi.previous_output.vout as u16,
                 value: prev_txo.value.amount_value(),
             }),
+            block_hash,
         );
         rows.push(history.into_row());
 
@@ -1432,17 +1471,26 @@ pub struct TxHistoryKey {
 
 pub struct TxHistoryRow {
     pub key: TxHistoryKey,
+    pub block_hash: Option<BlockHash>,
 }
 
 impl TxHistoryRow {
-    fn new(script: &Script, confirmed_height: u32, txinfo: TxHistoryInfo) -> Self {
+    fn new(
+        script: &Script,
+        confirmed_height: u32,
+        txinfo: TxHistoryInfo,
+        block_hash: &BlockHash,
+    ) -> Self {
         let key = TxHistoryKey {
             code: b'H',
             hash: compute_script_hash(&script),
             confirmed_height,
             txinfo,
         };
-        TxHistoryRow { key }
+        TxHistoryRow {
+            key,
+            block_hash: Some(*block_hash),
+        }
     }
 
     fn filter(code: u8, hash_prefix: &[u8]) -> Bytes {
@@ -1460,15 +1508,25 @@ impl TxHistoryRow {
     pub fn into_row(self) -> DBRow {
         DBRow {
             key: bincode::serialize_big(&self.key).unwrap(),
-            value: vec![],
+            value: if self.block_hash.is_none() {
+                vec![]
+            } else {
+                bincode::serialize_big(&(self.block_hash.unwrap())).unwrap()
+            },
         }
     }
 
     pub fn from_row(row: DBRow) -> Self {
         let key = bincode::deserialize_big(&row.key).expect("failed to deserialize TxHistoryKey");
-        TxHistoryRow { key }
+        TxHistoryRow {
+            key,
+            block_hash: if row.value.is_empty() {
+                None
+            } else {
+                bincode::deserialize_big(&row.value).ok()
+            },
+        }
     }
-
     pub fn get_txid(&self) -> Txid {
         self.key.txinfo.get_txid()
     }

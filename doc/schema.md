@@ -45,12 +45,12 @@ When the indexer is synced up to the tip of the chain, the hash of the tip is sa
 
 Each funding output (except for provably unspendable ones when `--index-unspendables` is not enabled) results in the following new rows (`H` is for history, `F` is for funding):
 
- * `"H{funding-scripthash}{funding-height}F{funding-txid:vout}{value}" → ""`
+ * `"H{funding-scripthash}{funding-height}F{funding-txid:vout}{value}" → "{funding-blockhash}"`
  * `"a{funding-address-str}" → ""` (for prefix address search, only saved when `--address-search` is enabled)
 
 Each spending input (except the coinbase) results in the following new rows (`S` is for spending):
 
- * `"H{funding-scripthash}{spending-height}S{spending-txid:vin}{funding-txid:vout}{value}" → ""`
+ * `"H{funding-scripthash}{spending-height}S{spending-txid:vin}{funding-txid:vout}{value}" → "{spending-blockhash}"`
 
  * `"S{funding-txid:vout}{spending-txid:vin}" → ""`
 
