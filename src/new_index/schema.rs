@@ -625,7 +625,7 @@ impl ChainQuery {
             .map(|(utxos_cache, height)| (from_utxo_cache(utxos_cache, self), height));
         let had_cache = cache.is_some();
         if !had_cache {
-            info!(
+            warn!(
                 "cache not hit for utxo set of {}",
                 scripthash.to_lower_hex_string()
             );
@@ -761,7 +761,7 @@ impl ChainQuery {
             });
 
         if cache.is_none() {
-            info!(
+            warn!(
                 "cache not hit for stats of {}",
                 scripthash.to_lower_hex_string()
             );
