@@ -741,6 +741,33 @@ fn handle_request(
                 TTL_SHORT,
             )
         }
+
+        (
+            &Method::GET,
+            Some(script_type @ &"address"),
+            Some(script_str),
+            Some(&"invalidate"),
+            None,
+            None,
+        )
+        | (
+            &Method::GET,
+            Some(script_type @ &"scripthash"),
+            Some(script_str),
+            Some(&"invalidate"),
+            None,
+            None,
+        ) => {
+            let script_hash = to_scripthash(script_type, script_str, config.network_type)?;
+            query.chain().invalidate_stats_cache(&script_hash[..]);
+            json_response(
+                json!({
+                    "ok":true
+                }),
+                TTL_SHORT,
+            )
+        }
+
         (
             &Method::GET,
             Some(script_type @ &"address"),
@@ -778,6 +805,90 @@ fn handle_request(
             );
 
             json_response(prepare_txs(txs, query, config), TTL_SHORT)
+        }
+
+        (
+            &Method::GET,
+            Some(script_type @ &"address"),
+            Some(script_str),
+            Some(&"funds"),
+            funding_height,
+            None,
+        )
+        | (
+            &Method::GET,
+            Some(script_type @ &"scripthash"),
+            Some(script_str),
+            Some(&"funds"),
+            funding_height,
+            None,
+        ) => {
+            let script_hash = to_scripthash(script_type, script_str, config.network_type)?;
+            let funding_height: Option<usize> =
+                funding_height.map(|height| height.parse().unwrap());
+            let results = query
+                .chain()
+                .funding_history(&script_hash[..], funding_height);
+            json_response(
+                json!({
+                    *script_type: script_str,
+                    "funding_total_txo": results.len(),
+                    "funding_total_value": results.iter().map(|(_, value, _)| value).sum::<u64>(),
+                    "funding_txs": results.iter()
+                        .map(|(txo, value, block)| (json!(
+                            {
+                                "txo": txo,
+                                "value":value,
+                                "confirmed_block": block
+                            }
+                        )))
+                        .collect::<Vec<_>>(),
+                }),
+                TTL_SHORT,
+            )
+        }
+
+        (
+            &Method::GET,
+            Some(script_type @ &"address"),
+            Some(script_str),
+            Some(&"spends"),
+            spending_height,
+            None,
+        )
+        | (
+            &Method::GET,
+            Some(script_type @ &"scripthash"),
+            Some(script_str),
+            Some(&"spends"),
+            spending_height,
+            None,
+        ) => {
+            let script_hash = to_scripthash(script_type, script_str, config.network_type)?;
+            let spending_height: Option<usize> =
+                spending_height.map(|height| height.parse().unwrap());
+            let results = query
+                .chain()
+                .spending_history(&script_hash[..], spending_height);
+            json_response(
+                json!({
+                    *script_type: script_str,
+                    "spending_total_txo": results.len(),
+                    "spending_total_value": results.iter().map(|(_, _,_,value, _)| value).sum::<u64>(),
+                    "spending_txs": results.iter()
+                        .map(|(txid,vin,txo,value,block)| (json!(
+                            {
+                                "spending_txid": txid,
+                                "spending_vin":vin,
+                                "txo": txo,
+                                "value":value,
+                                "confirmed_block": block
+                            }
+                        )))
+                        .collect::<Vec<_>>(),
+                }),
+                TTL_SHORT,
+            )
         }
 
         (
@@ -865,6 +976,33 @@ fn handle_request(
             // XXX paging?
             json_response(utxos, TTL_SHORT)
         }
+
+        (
+            &Method::GET,
+            Some(script_type @ &"address"),
+            Some(script_str),
+            Some(&"utxo"),
+            Some(&"invalidate"),
+            None,
+        )
+        | (
+            &Method::GET,
+            Some(script_type @ &"scripthash"),
+            Some(script_str),
+            Some(&"utxo"),
+            Some(&"invalidate"),
+            None,
+        ) => {
+            let script_hash = to_scripthash(script_type, script_str, config.network_type)?;
+            query.chain().invalidate_utxo_cache(&script_hash[..]);
+            json_response(
+                json!({
+                    "ok":true
+                }),
+                TTL_SHORT,
+            )
+        }
+
         (&Method::GET, Some(&"address-prefix"), Some(prefix), None, None, None) => {
             if !config.address_search {
                 return Err(HttpError::from("address search disabled".to_string()));

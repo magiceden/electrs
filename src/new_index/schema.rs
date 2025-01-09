@@ -471,11 +471,77 @@ impl ChainQuery {
             &TxHistoryRow::prefix_height(code, &hash[..], start_height as u32),
         )
     }
+
+    pub fn history_iter_scan_with_optional_height(
+        &self,
+        code: u8,
+        hash: &[u8],
+        option_height: Option<usize>,
+    ) -> ScanIterator {
+        match option_height {
+            Some(height) => self
+                .store
+                .history_db
+                .iter_scan(&TxHistoryRow::prefix_height(code, &hash[..], height as u32)),
+            None => self
+                .store
+                .history_db
+                .iter_scan(&TxHistoryRow::filter(code, &hash[..])),
+        }
+    }
+
     fn history_iter_scan_reverse(&self, code: u8, hash: &[u8]) -> ReverseScanIterator {
         self.store.history_db.iter_scan_reverse(
             &TxHistoryRow::filter(code, &hash[..]),
             &TxHistoryRow::prefix_end(code, &hash[..]),
         )
+    }
+
+    pub fn spending_history(
+        &self,
+        scripthash: &[u8],
+        spending_height: Option<usize>,
+    ) -> Vec<(Txid, u16, OutPoint, u64, BlockId)> {
+        self.history_iter_scan_with_optional_height(b'H', scripthash, spending_height)
+            .filter_map(|db_row| {
+                let row = TxHistoryRow::from_row(db_row);
+                match row.key.txinfo {
+                    TxHistoryInfo::Funding(_) => None,
+                    TxHistoryInfo::Spending(ref info) => Some((
+                        row.get_txid(),
+                        info.vin,
+                        row.get_funded_outpoint(),
+                        info.value,
+                    )),
+                }
+            })
+            .filter_map(|(txid, vin, outpoint, value)| {
+                self.tx_confirming_block(&txid)
+                    .map(|b| (txid, vin, outpoint, value, b))
+            })
+            .collect()
+    }
+
+    pub fn funding_history(
+        &self,
+        scripthash: &[u8],
+        funding_height: Option<usize>,
+    ) -> Vec<(OutPoint, u64, BlockId)> {
+        self.history_iter_scan_with_optional_height(b'H', scripthash, funding_height)
+            .filter_map(|db_row| {
+                let row = TxHistoryRow::from_row(db_row);
+                match row.key.txinfo {
+                    TxHistoryInfo::Funding(ref info) => {
+                        Some((row.get_funded_outpoint(), info.value))
+                    }
+                    TxHistoryInfo::Spending(_) => None,
+                }
+            })
+            .filter_map(|(outpoint, value)| {
+                self.tx_confirming_block(&outpoint.txid)
+                    .map(|b| (outpoint, value, b))
+            })
+            .collect()
     }
 
     pub fn history(
@@ -537,6 +603,10 @@ impl ChainQuery {
             .collect()
     }
 
+    pub fn invalidate_utxo_cache(&self, scripthash: &[u8]) {
+        self.store.cache_db.delete(&UtxoCacheRow::key(scripthash));
+    }
+
     // TODO: avoid duplication with stats/stats_delta?
     pub fn utxo(&self, scripthash: &[u8], limit: usize) -> Result<Vec<Utxo>> {
         let _timer = self.start_timer("utxo");
@@ -554,6 +624,12 @@ impl ChainQuery {
             })
             .map(|(utxos_cache, height)| (from_utxo_cache(utxos_cache, self), height));
         let had_cache = cache.is_some();
+        if !had_cache {
+            info!(
+                "cache not hit for utxo set of {}",
+                scripthash.to_lower_hex_string()
+            );
+        }
 
         // update utxo set with new transactions since
         let (newutxos, lastblock, processed_items) = cache.map_or_else(
@@ -631,7 +707,17 @@ impl ChainQuery {
                 TxHistoryInfo::Funding(ref info) => {
                     utxos.insert(history.get_funded_outpoint(), (blockid, info.value))
                 }
-                TxHistoryInfo::Spending(_) => utxos.remove(&history.get_funded_outpoint()),
+                TxHistoryInfo::Spending(_) => {
+                    let exist = utxos.remove(&history.get_funded_outpoint());
+                    if exist.is_none() {
+                        error!(
+                            "spending a non-exist utxo {} for script hash {}",
+                            history.get_funded_outpoint().to_string(),
+                            scripthash.to_lower_hex_string()
+                        );
+                    }
+                    exist
+                }
                 #[cfg(feature = "liquid")]
                 TxHistoryInfo::Issuing(_)
                 | TxHistoryInfo::Burning(_)
@@ -655,6 +741,10 @@ impl ChainQuery {
         Ok((utxos, lastblock, processed_items))
     }
 
+    pub fn invalidate_stats_cache(&self, scripthash: &[u8]) {
+        self.store.cache_db.delete(&StatsCacheRow::key(scripthash));
+    }
+
     pub fn stats(&self, scripthash: &[u8]) -> ScriptStats {
         let _timer = self.start_timer("stats");
 
@@ -669,6 +759,13 @@ impl ChainQuery {
                 self.height_by_hash(&blockhash)
                     .map(|height| (stats, height))
             });
+
+        if cache.is_none() {
+            info!(
+                "cache not hit for stats of {}",
+                scripthash.to_lower_hex_string()
+            );
+        }
 
         // update stats with new transactions since
         let (newstats, lastblock) = cache.map_or_else(

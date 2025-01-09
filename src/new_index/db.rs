@@ -178,6 +178,10 @@ impl DB {
         self.db.write_opt(batch, &opts).unwrap();
     }
 
+    pub fn delete(&self, key: &[u8]) {
+        self.db.delete(key).unwrap();
+    }
+
     pub fn flush(&self) {
         self.db.flush().unwrap();
     }
