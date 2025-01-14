@@ -624,12 +624,6 @@ impl ChainQuery {
             })
             .map(|(utxos_cache, height)| (from_utxo_cache(utxos_cache, self), height));
         let had_cache = cache.is_some();
-        if !had_cache {
-            warn!(
-                "cache not hit for utxo set of {}",
-                scripthash.to_lower_hex_string()
-            );
-        }
 
         // update utxo set with new transactions since
         let (newutxos, lastblock, processed_items) = cache.map_or_else(
@@ -759,13 +753,6 @@ impl ChainQuery {
                 self.height_by_hash(&blockhash)
                     .map(|height| (stats, height))
             });
-
-        if cache.is_none() {
-            warn!(
-                "cache not hit for stats of {}",
-                scripthash.to_lower_hex_string()
-            );
-        }
 
         // update stats with new transactions since
         let (newstats, lastblock) = cache.map_or_else(
